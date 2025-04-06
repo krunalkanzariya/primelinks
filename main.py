@@ -917,7 +917,23 @@ async def main():
             # Create web app
             app = web.Application()
             app.router.add_get('/', health_check)
-            app.router.add_post('/webhook', lambda request: application.update_queue.put(request))
+            
+            # Set up webhook handler
+            async def handle_webhook(request):
+                try:
+                    update = await Update.de_json(await request.json(), application.bot)
+                    await application.process_update(update)
+                    return web.Response(status=200)
+                except Exception as e:
+                    logger.error(f"Error processing webhook: {e}")
+                    return web.Response(status=500)
+
+            app.router.add_post(f'/{application.bot.token}', handle_webhook)
+            
+            # Set webhook URL
+            webhook_url = f"{WEBHOOK_URL}/{application.bot.token}"
+            await application.bot.set_webhook(webhook_url)
+            logger.info(f"Webhook set to {webhook_url}")
             
             return app, application
         else:
@@ -978,7 +994,7 @@ def run_production():
         loop.run_until_complete(application.start())
         
         # Run the web app
-        web.run_app(web_app, host='0.0.0.0', port=PORT)
+        web.run_app(web_app, host='0.0.0.0', port=PORT, access_log=None)
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
