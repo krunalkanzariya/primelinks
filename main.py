@@ -921,18 +921,31 @@ async def main():
             # Set up webhook handler
             async def handle_webhook(request):
                 try:
-                    update = await Update.de_json(await request.json(), application.bot)
+                    data = await request.json()
+                    logger.info(f"Received webhook data: {data}")
+                    
+                    # Process the update
+                    update = Update.de_json(data, application.bot)
                     await application.process_update(update)
+                    
                     return web.Response(status=200)
                 except Exception as e:
                     logger.error(f"Error processing webhook: {e}")
                     return web.Response(status=500)
 
-            app.router.add_post(f'/{application.bot.token}', handle_webhook)
+            # Add webhook route
+            app.router.add_post('/webhook', handle_webhook)
+            
+            # Initialize the application
+            await application.initialize()
             
             # Set webhook URL
-            webhook_url = f"{WEBHOOK_URL}/{application.bot.token}"
-            await application.bot.set_webhook(webhook_url)
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            await application.bot.delete_webhook()  # Delete any existing webhook
+            await application.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=Update.ALL_TYPES
+            )
             logger.info(f"Webhook set to {webhook_url}")
             
             return app, application
@@ -989,8 +1002,7 @@ def run_production():
         # Start the bot and get the web app
         web_app, application = loop.run_until_complete(main())
         
-        # Initialize and start the application
-        loop.run_until_complete(application.initialize())
+        # Start the application
         loop.run_until_complete(application.start())
         
         # Run the web app
