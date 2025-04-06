@@ -30,8 +30,10 @@ ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if 
 # Dictionary to store products (will be loaded from MongoDB)
 PRODUCTS = {}
 
-# Get port number from environment variable
+# Get environment variables
 PORT = int(os.getenv('PORT', 8080))
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'development').lower()
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 
 def load_products_from_db():
     """Load products from MongoDB into memory."""
@@ -770,57 +772,110 @@ async def start_web_app():
     await site.start()
     logger.info(f"Web app started on port {PORT}")
 
-def main():
+async def main():
     """Start the bot."""
-    # Load products from database at startup
-    load_products_from_db()
-    
-    # Create the Application with job queue enabled
-    application = (
-        Application.builder()
-        .token(os.getenv('TELEGRAM_BOT_TOKEN'))
-        .concurrent_updates(True)
-        .build()
-    )
+    try:
+        # Load products from database at startup
+        load_products_from_db()
+        
+        # Create the Application with job queue enabled
+        application = (
+            Application.builder()
+            .token(os.getenv('TELEGRAM_BOT_TOKEN'))
+            .concurrent_updates(True)
+            .build()
+        )
 
-    # Store start time
-    application.bot_data["start_time"] = datetime.now()
+        # Store start time
+        application.bot_data["start_time"] = datetime.now()
 
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("deals", deals))
-    application.add_handler(CommandHandler("category", show_categories))
-    
-    # Admin commands
-    application.add_handler(CommandHandler("link", add_product))
-    application.add_handler(CommandHandler("list", list_products))
-    application.add_handler(CommandHandler("remove", remove_product))
-    
-    # Add category handlers
-    for category in PRODUCTS.keys():
-        application.add_handler(CommandHandler(category.lower(), category_products))
+        # Add command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("deals", deals))
+        application.add_handler(CommandHandler("category", show_categories))
+        
+        # Admin commands
+        application.add_handler(CommandHandler("link", add_product))
+        application.add_handler(CommandHandler("list", list_products))
+        application.add_handler(CommandHandler("remove", remove_product))
+        
+        # Add category handlers
+        for category in PRODUCTS.keys():
+            application.add_handler(CommandHandler(category.lower(), category_products))
 
-    # Add callback query handler
-    application.add_handler(CallbackQueryHandler(handle_button))
-    
-    # Add inline query handler
-    application.add_handler(InlineQueryHandler(inline_query))
+        # Add callback query handler
+        application.add_handler(CallbackQueryHandler(handle_button))
+        
+        # Add inline query handler
+        application.add_handler(InlineQueryHandler(inline_query))
 
-    # Add ping service job (runs every 50 seconds)
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(ping_service, interval=50, first=10)
-        logger.info("Ping service scheduled successfully (running every 50 seconds)")
-    else:
-        logger.warning("Job queue is not available. Ping service will not run.")
+        # Add ping service job (runs every 50 seconds)
+        job_queue = application.job_queue
+        if job_queue:
+            job_queue.run_repeating(ping_service, interval=50, first=10)
+            logger.info("Ping service scheduled successfully (running every 50 seconds)")
+        else:
+            logger.warning("Job queue is not available. Ping service will not run.")
 
-    # Start web app in the background
-    asyncio.create_task(start_web_app())
+        # Initialize the application
+        await application.initialize()
 
-    # Start the Bot
-    logger.info(f"Starting bot on port {PORT}...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        if ENVIRONMENT == 'production':
+            # Production mode (Render)
+            logger.info("Starting bot in production mode...")
+            
+            # Start web app
+            await start_web_app()
+            
+            # Set webhook
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            await application.bot.set_webhook(url=webhook_url)
+            
+            # Start webhook
+            async with web.TCPSite(
+                web.Application().add_routes([web.post('/webhook', application.update_queue.put)]),
+                '0.0.0.0',
+                PORT
+            ) as site:
+                logger.info(f"Webhook started on port {PORT}")
+                try:
+                    await asyncio.Event().wait()  # run forever
+                except asyncio.CancelledError:
+                    pass
+        else:
+            # Development mode (local)
+            logger.info("Starting bot in development mode...")
+            await application.start()
+            await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        raise
+    finally:
+        # Cleanup
+        try:
+            if ENVIRONMENT == 'production':
+                await application.bot.delete_webhook()
+            await application.stop()
+            await application.shutdown()
+            db.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
 if __name__ == '__main__':
-    main() 
+    try:
+        # Run the main function
+        if ENVIRONMENT == 'production':
+            # Production: Use web.run_app
+            web_app = web.Application()
+            web_app.router.add_get('/', health_check)
+            web.run_app(web_app, host='0.0.0.0', port=PORT)
+        else:
+            # Development: Use asyncio.run
+            asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise 
