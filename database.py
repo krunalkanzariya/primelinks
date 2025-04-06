@@ -146,4 +146,44 @@ class Database:
         try:
             self.client.close()
         except PyMongoError as e:
-            logger.error(f"Error closing database connection: {e}") 
+            logger.error(f"Error closing database connection: {e}")
+
+    def ping(self):
+        """Test database connection."""
+        try:
+            # Try to execute a simple command
+            self.db.command('ping')
+            return True
+        except PyMongoError as e:
+            logger.error(f"Database ping failed: {e}")
+            raise
+
+    def reconnect(self):
+        """Reconnect to the database."""
+        try:
+            # Close existing connection if any
+            try:
+                self.client.close()
+            except:
+                pass
+
+            # Create new connection
+            self.client = MongoClient(
+                "mongodb+srv://krunalkanzariya:krunalkanzariya@primelinks.p0aov5y.mongodb.net/?retryWrites=true&w=majority&appName=primelinks",
+                serverSelectionTimeoutMS=5000  # 5 second timeout
+            )
+            self.db = self.client.primelinks
+            
+            # Verify connection
+            self.ping()
+            
+            # Recreate collections references
+            self.users = self.db.users
+            self.products = self.db.products
+            self.categories = self.db.categories
+            
+            logger.info("Successfully reconnected to MongoDB")
+            return True
+        except PyMongoError as e:
+            logger.error(f"Failed to reconnect to MongoDB: {e}")
+            raise 
