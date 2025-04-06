@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from database import Database
 from sqlalchemy.exc import SQLAlchemyError
 from scraper import get_product_details, is_valid_amazon_url
+from aiohttp import web
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +29,9 @@ ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if 
 
 # Dictionary to store products (will be loaded from MongoDB)
 PRODUCTS = {}
+
+# Get port number from environment variable
+PORT = int(os.getenv('PORT', 8080))
 
 def load_products_from_db():
     """Load products from MongoDB into memory."""
@@ -746,6 +750,26 @@ async def ping_service(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in ping service: {e}")
 
+# Create web app for health check
+async def health_check(request):
+    """Health check endpoint for Render."""
+    return web.Response(text='Bot is running!')
+
+async def web_app():
+    """Create web app for health check."""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    return app
+
+async def start_web_app():
+    """Start the web application."""
+    app = await web_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Web app started on port {PORT}")
+
 def main():
     """Start the bot."""
     # Load products from database at startup
@@ -791,8 +815,11 @@ def main():
     else:
         logger.warning("Job queue is not available. Ping service will not run.")
 
+    # Start web app in the background
+    asyncio.create_task(start_web_app())
+
     # Start the Bot
-    logger.info("Starting bot...")
+    logger.info(f"Starting bot on port {PORT}...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
