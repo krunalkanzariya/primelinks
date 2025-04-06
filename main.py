@@ -39,22 +39,31 @@ def load_products_from_db():
     """Load products from MongoDB into memory."""
     global PRODUCTS
     try:
+        # Get all categories first
+        categories = db.get_all_categories()
+        
+        # Initialize PRODUCTS with empty lists for all categories
+        PRODUCTS = {category: [] for category in categories}
+        
         # Get all products from database
         all_products = db.get_all_products()
         
         # Organize products by category
-        PRODUCTS.clear()
         for product in all_products:
             category = product['category']
-            if category not in PRODUCTS:
-                PRODUCTS[category] = []
             # Convert MongoDB _id to string for JSON serialization
             product['_id'] = str(product['_id'])
-            PRODUCTS[category].append(product)
+            if category in PRODUCTS:
+                PRODUCTS[category].append(product)
+            else:
+                # If category doesn't exist (shouldn't happen), create it
+                PRODUCTS[category] = [product]
         
-        logger.info(f"Loaded {len(all_products)} products from database")
+        logger.info(f"Loaded {len(all_products)} products across {len(categories)} categories")
     except Exception as e:
         logger.error(f"Error loading products from database: {e}")
+        # Don't clear PRODUCTS on error
+        return
 
 def is_admin(user_id):
     """Check if user is an admin."""
@@ -772,13 +781,94 @@ async def start_web_app():
     await site.start()
     logger.info(f"Web app started on port {PORT}")
 
+async def category_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new category."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ This command is only for admins.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Please provide a category name.\nExample: /category_add Electronics")
+        return
+
+    category = context.args[0].capitalize()
+    try:
+        # Check if category already exists
+        if category in PRODUCTS:
+            await update.message.reply_text(f"❌ Category '{category}' already exists!")
+            return
+
+        # Add category to database
+        if db.add_category(category):
+            # Initialize empty product list for new category
+            PRODUCTS[category] = []
+            await update.message.reply_text(f"✅ Category '{category}' added successfully!")
+        else:
+            await update.message.reply_text("❌ Failed to add category. Please try again.")
+
+    except Exception as e:
+        logger.error(f"Error adding category: {e}")
+        await update.message.reply_text("❌ An error occurred while adding the category.")
+
+async def category_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a category and all its products."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ This command is only for admins.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Please provide a category name.\nExample: /category_remove Electronics")
+        return
+
+    category = context.args[0].capitalize()
+    try:
+        # Check if category exists
+        if category not in PRODUCTS:
+            await update.message.reply_text(f"❌ Category '{category}' does not exist!")
+            return
+
+        # Get number of products in category
+        num_products = len(PRODUCTS[category])
+
+        # Check if this is a confirmation command
+        is_confirmation = len(context.args) > 1 and context.args[1].lower() == 'confirm'
+        
+        # If category has products and this is not a confirmation, ask for confirmation
+        if num_products > 0 and not is_confirmation:
+            await update.message.reply_text(
+                f"⚠️ Category '{category}' has {num_products} products.\n"
+                "All products in this category will be deleted.\n"
+                f"To confirm, use: /category_remove {category} confirm"
+            )
+            return
+        
+        # Proceed with removal (either empty category or confirmed)
+        if db.remove_category(category):
+            # Remove category from memory
+            del PRODUCTS[category]
+            if num_products > 0:
+                await update.message.reply_text(
+                    f"✅ Category '{category}' and its {num_products} products have been removed successfully!"
+                )
+            else:
+                await update.message.reply_text(f"✅ Category '{category}' removed successfully!")
+            
+            # Reload products from database to ensure sync
+            load_products_from_db()
+        else:
+            await update.message.reply_text("❌ Failed to remove category. Please try again.")
+
+    except Exception as e:
+        logger.error(f"Error removing category: {e}")
+        await update.message.reply_text("❌ An error occurred while removing the category.")
+
 async def main():
     """Start the bot."""
     try:
         # Load products from database at startup
         load_products_from_db()
         
-        # Create the Application with job queue enabled
+        # Create the Application
         application = (
             Application.builder()
             .token(os.getenv('TELEGRAM_BOT_TOKEN'))
@@ -799,6 +889,8 @@ async def main():
         application.add_handler(CommandHandler("link", add_product))
         application.add_handler(CommandHandler("list", list_products))
         application.add_handler(CommandHandler("remove", remove_product))
+        application.add_handler(CommandHandler("category_add", category_add))
+        application.add_handler(CommandHandler("category_remove", category_remove))
         
         # Add category handlers
         for category in PRODUCTS.keys():
@@ -818,64 +910,93 @@ async def main():
         else:
             logger.warning("Job queue is not available. Ping service will not run.")
 
-        # Initialize the application
-        await application.initialize()
-
         if ENVIRONMENT == 'production':
             # Production mode (Render)
             logger.info("Starting bot in production mode...")
             
-            # Start web app
-            await start_web_app()
+            # Create web app
+            app = web.Application()
+            app.router.add_get('/', health_check)
+            app.router.add_post('/webhook', lambda request: application.update_queue.put(request))
             
-            # Set webhook
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-            await application.bot.set_webhook(url=webhook_url)
-            
-            # Start webhook
-            async with web.TCPSite(
-                web.Application().add_routes([web.post('/webhook', application.update_queue.put)]),
-                '0.0.0.0',
-                PORT
-            ) as site:
-                logger.info(f"Webhook started on port {PORT}")
-                try:
-                    await asyncio.Event().wait()  # run forever
-                except asyncio.CancelledError:
-                    pass
+            return app, application
         else:
             # Development mode (local)
             logger.info("Starting bot in development mode...")
-            await application.start()
-            await application.run_polling(allowed_updates=Update.ALL_TYPES)
+            return None, application
 
     except Exception as e:
         logger.error(f"Error in main: {e}")
         raise
-    finally:
-        # Cleanup
+
+def run_development():
+    """Run the bot in development mode."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Start the bot
+        _, application = loop.run_until_complete(main())
+        
+        # Initialize and start the application
+        loop.run_until_complete(application.initialize())
+        loop.run_until_complete(application.start())
+        
+        # Run polling in the background
+        loop.create_task(application.updater.start_polling())
+        
+        # Keep the bot running
         try:
-            if ENVIRONMENT == 'production':
-                await application.bot.delete_webhook()
-            await application.stop()
-            await application.shutdown()
+            loop.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
+    finally:
+        try:
+            # Cleanup
+            loop.run_until_complete(application.stop())
+            loop.run_until_complete(application.shutdown())
+            loop.close()
+            db.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+
+def run_production():
+    """Run the bot in production mode."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Start the bot and get the web app
+        web_app, application = loop.run_until_complete(main())
+        
+        # Initialize and start the application
+        loop.run_until_complete(application.initialize())
+        loop.run_until_complete(application.start())
+        
+        # Run the web app
+        web.run_app(web_app, host='0.0.0.0', port=PORT)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
+    finally:
+        try:
+            # Cleanup
+            loop.run_until_complete(application.bot.delete_webhook())
+            loop.run_until_complete(application.stop())
+            loop.run_until_complete(application.shutdown())
+            loop.close()
             db.close()
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
 if __name__ == '__main__':
-    try:
-        # Run the main function
-        if ENVIRONMENT == 'production':
-            # Production: Use web.run_app
-            web_app = web.Application()
-            web_app.router.add_get('/', health_check)
-            web.run_app(web_app, host='0.0.0.0', port=PORT)
-        else:
-            # Development: Use asyncio.run
-            asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise 
+    if ENVIRONMENT == 'production':
+        run_production()
+    else:
+        run_development() 
