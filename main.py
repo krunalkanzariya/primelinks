@@ -2,7 +2,7 @@ import os
 import logging
 import random
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, InlineQueryHandler
@@ -687,13 +687,80 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.inline_query.answer(results, cache_time=1)
 
+async def ping_service(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic task to keep the bot alive and check database connection."""
+    try:
+        # Get the chat ID from environment variable or use a default admin ID
+        ping_chat_id = int(os.getenv('PING_CHAT_ID', ADMIN_IDS[0] if ADMIN_IDS else None))
+        
+        if not ping_chat_id:
+            logger.warning("No ping chat ID configured. Ping service will run silently.")
+            return
+
+        # Check MongoDB connection
+        try:
+            # Try to ping MongoDB
+            db.ping()
+            db_status = "✅ Connected"
+        except Exception as e:
+            db_status = f"❌ Error: {str(e)}"
+            # Try to reconnect to database
+            try:
+                db.reconnect()
+                db_status += "\n♻️ Reconnected successfully"
+            except Exception as e:
+                db_status += f"\n❌ Reconnection failed: {str(e)}"
+
+        # Get bot statistics
+        stats = {
+            "uptime": datetime.now() - context.bot_data.get("start_time", datetime.now()),
+            "products": sum(len(products) for products in PRODUCTS.values()),
+            "categories": len(PRODUCTS),
+            **db.get_user_stats()
+        }
+
+        # Format status message
+        status_message = (
+            "🤖 *Bot Status Report*\n\n"
+            f"🕒 Uptime: {str(stats['uptime']).split('.')[0]}\n"
+            f"📊 Database: {db_status}\n\n"
+            f"📦 Products: {stats['products']}\n"
+            f"📂 Categories: {stats['categories']}\n"
+            f"👥 Total Users: {stats['total_users']}\n"
+            f"📱 Active Today: {stats['active_today']}\n\n"
+            f"🔄 Last Check: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        # Send status message silently (without notification)
+        await context.bot.send_message(
+            chat_id=ping_chat_id,
+            text=status_message,
+            parse_mode='Markdown',
+            disable_notification=True
+        )
+
+        # Reload products from database periodically
+        load_products_from_db()
+        
+        logger.info("Ping service completed successfully")
+    except Exception as e:
+        logger.error(f"Error in ping service: {e}")
+
 def main():
     """Start the bot."""
     # Load products from database at startup
     load_products_from_db()
     
-    # Create the Application and pass it your bot's token
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+    # Create the Application with job queue enabled
+    application = (
+        Application.builder()
+        .token(os.getenv('TELEGRAM_BOT_TOKEN'))
+        .concurrent_updates(True)
+        .build()
+    )
+
+    # Store start time
+    application.bot_data["start_time"] = datetime.now()
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
@@ -716,7 +783,16 @@ def main():
     # Add inline query handler
     application.add_handler(InlineQueryHandler(inline_query))
 
+    # Add ping service job (runs every 50 seconds)
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(ping_service, interval=50, first=10)
+        logger.info("Ping service scheduled successfully (running every 50 seconds)")
+    else:
+        logger.warning("Job queue is not available. Ping service will not run.")
+
     # Start the Bot
+    logger.info("Starting bot...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
