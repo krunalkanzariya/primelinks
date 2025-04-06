@@ -2,6 +2,7 @@ from datetime import datetime
 import logging
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -9,23 +10,20 @@ class Database:
     def __init__(self):
         """Initialize database connection."""
         try:
-            # Connect to MongoDB
-            self.client = MongoClient("mongodb+srv://krunalkanzariya:krunalkanzariya@primelinks.p0aov5y.mongodb.net/?retryWrites=true&w=majority&appName=primelinks")
-            self.db = self.client.primelinks
-            
-            # Create collections
+            self.client = MongoClient(os.getenv('MONGODB_URI'))
+            self.db = self.client[os.getenv('DB_NAME', 'amazon_deals_bot')]
             self.users = self.db.users
             self.products = self.db.products
-            self.categories = self.db.categories
+            self.categories = self.db.categories  # New collection for categories
             
             # Create indexes
             self.users.create_index("telegram_id", unique=True)
             self.products.create_index("title")
             self.categories.create_index("name", unique=True)
             
-            logger.info("Successfully connected to MongoDB")
-        except PyMongoError as e:
-            logger.error(f"Failed to connect to MongoDB: {e}")
+            logger.info("Connected to MongoDB successfully")
+        except Exception as e:
+            logger.error(f"Error connecting to MongoDB: {e}")
             raise
 
     def add_user(self, telegram_id: int, username: str, joined_date: datetime):
@@ -59,24 +57,98 @@ class Database:
             logger.error(f"Error updating user activity: {e}")
             return False
 
-    def add_product(self, product_data: dict, category: str):
-        """Add new product to database."""
+    def add_category(self, category_name):
+        """Add a new category to the database."""
         try:
-            # Add category if it doesn't exist
+            # Check if category already exists
+            if self.categories.find_one({'name': category_name}):
+                return False
+            
+            # Add new category
+            result = self.categories.insert_one({
+                'name': category_name,
+                'created_at': datetime.now(),
+                'updated_at': datetime.now()
+            })
+            
+            return bool(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Error adding category: {e}")
+            return False
+
+    def remove_category(self, category_name):
+        """Remove a category and all its products from the database."""
+        try:
+            # Start a session for atomic operation
+            with self.client.start_session() as session:
+                with session.start_transaction():
+                    # First, remove all products in this category
+                    delete_products_result = self.products.delete_many(
+                        {'category': category_name},
+                        session=session
+                    )
+                    
+                    # Then remove the category
+                    delete_category_result = self.categories.delete_one(
+                        {'name': category_name},
+                        session=session
+                    )
+                    
+                    if delete_category_result.deleted_count > 0:
+                        logger.info(f"Successfully removed category '{category_name}' and {delete_products_result.deleted_count} products")
+                        return True
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error removing category and its products: {e}")
+            return False
+
+    def get_all_categories(self):
+        """Get all categories from the database."""
+        try:
+            # Find all categories and sort them alphabetically
+            categories = list(self.categories.find({}).sort('name', 1))
+            return [cat['name'] for cat in categories]
+        except Exception as e:
+            logger.error(f"Error getting categories: {e}")
+            return []
+
+    def ensure_category_exists(self, category_name):
+        """Ensure a category exists in the database."""
+        try:
+            # Try to insert if not exists
             self.categories.update_one(
-                {"name": category},
-                {"$set": {"name": category}},
+                {'name': category_name},
+                {
+                    '$setOnInsert': {
+                        'name': category_name,
+                        'created_at': datetime.now(),
+                        'updated_at': datetime.now()
+                    }
+                },
                 upsert=True
             )
+            return True
+        except Exception as e:
+            logger.error(f"Error ensuring category exists: {e}")
+            return False
+
+    def add_product(self, product_data, category):
+        """Add a new product to the database."""
+        try:
+            # Ensure category exists
+            if not self.categories.find_one({'name': category}):
+                # Create category if it doesn't exist
+                self.add_category(category)
             
-            # Add product with category reference
+            # Add category to product data
             product_data['category'] = category
-            product_data['added_date'] = datetime.now()
-            product_data['last_updated'] = datetime.now()
+            product_data['created_at'] = datetime.now()
+            product_data['updated_at'] = datetime.now()
             
             result = self.products.insert_one(product_data)
-            return str(result.inserted_id)
-        except PyMongoError as e:
+            return str(result.inserted_id) if result.inserted_id else None
+        except Exception as e:
             logger.error(f"Error adding product: {e}")
             return None
 
@@ -94,14 +166,6 @@ class Database:
             return list(self.products.find())
         except PyMongoError as e:
             logger.error(f"Error getting all products: {e}")
-            return []
-
-    def get_all_categories(self):
-        """Get all categories."""
-        try:
-            return [cat['name'] for cat in self.categories.find()]
-        except PyMongoError as e:
-            logger.error(f"Error getting categories: {e}")
             return []
 
     def remove_product(self, product_id: str):
